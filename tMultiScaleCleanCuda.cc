@@ -60,7 +60,7 @@ void writeImage(const string& filename, vector<float>& image)
     file.write(reinterpret_cast<char *>(&image[0]), image.size() * sizeof(float));
     file.close();
 }
-float lininterp(vector<float> f, float x) 
+float lininterp(float* f, float x) 
 {
     float delx = x - floorf(x);
     int x0 = (int)floorf(x);
@@ -77,7 +77,7 @@ std::vector<float> buildComponent(const string& filename, size_t img_size)
         for(int p=-img_size/2;p<img_size/2;p++) 
         {
              float r = sqrt(pow(q*g_grid,2)+pow(p*g_grid,2));
-             image.push_back(lininterp(prolsph, r/g_grid+prolsph.size()/2));
+             image.push_back(lininterp(&prolsph[0], r/g_grid+prolsph.size()/2));
         }
     }
     return image;
@@ -150,20 +150,20 @@ int main(int argc, char** argv)
     cout << "psf_wid = " << psf_wid << endl;
 
     //PSF's for varying width for multi-scale
-    int widths[5] = {0, 2, 4, 8, 16};
-    vector<float> MSpsf[5];  
+    int widths[g_nComponent] = {0, 2, 4, 8, 16};
+    vector<float> MSpsf[g_nComponent];  
     vector<float> baseComponent;
-    vector<float> componentCross[5*5];
-    float peak_scale[5];
-    for (int q=0; q<5; q++) {
-       peak_scale[q] = 1 - (0.6*widths[q])/widths[5-1];
+    vector<float> componentCross[g_nComponent*g_nComponent];
+    float peak_scale[g_nComponent];
+    for (int q=0; q<g_nComponent; q++) {
+       peak_scale[q] = 1 - (0.6*widths[q])/widths[g_nComponent-1];
        baseComponent = buildComponent(g_prolsphFile, g_componentSize);
-       for (int p=0;p<5;p++) {
+       for (int p=0;p<g_nComponent;p++) {
           vector<float> envelope = buildEnvelope(widths[p], g_componentSize);
           //TODO multiply each envelope with baseComponent
           MSpsf[q] = readImage(g_psfFile);
           //TODO convolve each MSpsf with every other
-          componentCross[q*5+p] = readImage(g_psfFile);
+          componentCross[q*g_nComponent+p] = readImage(g_psfFile);
           //TODO convolve each MSpsf and componentCross with PSF
        }
     }
@@ -178,9 +178,9 @@ int main(int argc, char** argv)
     //
     // Run the golden version of the code
     //
-    vector<float> goldenResidual[5];
+    vector<float> goldenResidual[g_nComponent];
     //TODO No need to read this from file
-    for (int s=0;s<5;s++) goldenResidual[s] = readImage(g_dirtyFile);
+    for (int s=0;s<g_nComponent;s++) goldenResidual[s] = readImage(g_dirtyFile);
 
     vector<float> goldenModel(dirty.size());
     if (computeGolden)
@@ -189,7 +189,7 @@ int main(int argc, char** argv)
         {
             // Now we can do the timing for the serial (Golden) CPU implementation
             cout << "+++++ Forward processing (CPU Golden) +++++" << endl;
-            MultiScaleGolden golden(5);
+            MultiScaleGolden golden(g_nComponent);
 
             Stopwatch sw;
             sw.start();
@@ -213,15 +213,15 @@ int main(int argc, char** argv)
     // Run the CUDA version of the code
     //
     //vector<float> cudaResidual(dirty.size());
-    vector<float> cudaResidual[5];
-    for (int s=0;s<5;s++) cudaResidual[s] = readImage(g_dirtyFile);
+    vector<float> cudaResidual[g_nComponent];
+    for (int s=0;s<g_nComponent;s++) cudaResidual[s] = readImage(g_dirtyFile);
     //TODO convolve each residual with it's widened PSF
     vector<float> cudaModel(dirty.size());
     zeroInit(cudaModel);
     {
         // Now we can do the timing for the CUDA implementation
         cout << "+++++ Forward processing (CUDA) +++++" << endl;
-        MultiScaleCuda cuda(MSpsf[0].size(), 5, cudaResidual[0].size());
+        MultiScaleCuda cuda(MSpsf[0].size(), g_nComponent, cudaResidual[0].size());
 
         Stopwatch sw;
         sw.start();
@@ -247,7 +247,7 @@ int main(int argc, char** argv)
 
     cout << "Verifying residual...";
     bool residualDiff = true; 
-    for (int s=0;s<5;s++) {
+    for (int s=0;s<g_nComponent;s++) {
        residualDiff = residualDiff && compare(goldenResidual[s], cudaResidual[s]);
     }
     if (!residualDiff) {

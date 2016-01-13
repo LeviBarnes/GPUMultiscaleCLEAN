@@ -49,6 +49,19 @@ struct Position {
     int y;
 };
 
+struct listModel {
+    Peak* peaks;
+    int n_comp;
+    listModel() {
+       cudaMalloc(&peaks, sizeof(Peak)*g_maxModelComponents);
+       n_comp = 0;
+    }
+    ~listModel() {
+       cudaFree(peaks); peaks = NULL;
+       n_comp = -1;
+    }
+};
+
 __host__
 static void checkerror(cudaError_t err)
 {
@@ -92,6 +105,56 @@ struct MaxOp
     }
 };
 
+#if 0
+__device__ float kernelLookup(float* rad_vals, Position p1, Position p2) {
+    int dx = p1.x - p2.x;
+    int dy = p1.y - p2.y;
+    float r = sqrt((float)(dx*dx+dy*dy));
+    return lininterp(rad_vals, r);
+}
+#else
+__device__ float kernelLookup(float* rad_vals, Position p1, Position p2) {
+    int dx = p1.x - p2.x;
+    int dy = p1.y - p2.y;
+    return rad_vals[dx+dy*KSIZE];
+}
+#endif
+
+__global__ 
+void d_findPeak(Peak *peaks, const float* __restrict__ image, int size, 
+                float** d_cross_radial, int d_cross_width, 
+                Peak* modelPeaks, int n_comp)
+{
+    Peak threadMax = {0.0, 0};   
+
+    // parallel raking reduction (independent threads)
+    for (int i = findPeakWidth * blockIdx.x + threadIdx.x; 
+        i < size; 
+        i += gridDim.x * findPeakWidth) {
+
+        Position this_pos = idxToPos(i,d_cross_width);
+        float this_val = image[i]; 
+        for (int c = 0; c < n_comp; c++) {
+            //TODO check for bounds before calling kernelLookup?
+            this_val -= modelPeaks[c].val*kernelLookup(d_cross_radial[modelPeaks[c].scale]+ 
+                                                          d_cross_width*d_cross_width/2,
+                                                       this_pos, idxToPos(modelPeaks[c].pos, 
+                                                                 d_cross_width)             );
+        } 
+        if (abs(this_val) > abs(threadMax.val)) {
+            threadMax.val = image[i];
+            threadMax.pos = i;
+        }
+    }
+
+    // Use CUB to find the max for each thread block.
+    typedef cub::BlockReduce<Peak, findPeakWidth> BlockMax;
+    __shared__ typename BlockMax::TempStorage temp_storage;
+    threadMax = BlockMax(temp_storage).Reduce(threadMax, MaxOp());
+
+    if (threadIdx.x == 0) peaks[blockIdx.x] = threadMax;
+}
+
 __global__ 
 void d_findPeak(Peak *peaks, const float* __restrict__ image, int size)
 {
@@ -119,7 +182,31 @@ __host__
 static Peak findPeak(Peak *d_peaks, const float* d_image, size_t size)
 {
     // Find peak
-    d_findPeak<<<findPeakNBlocks, findPeakWidth>>>(d_peaks, d_image, size);   
+    d_findPeak<<<findPeakNBlocks, findPeakWidth>>>(d_peaks, d_image, size);
+    
+    // Get the peaks array back from the device
+    Peak peaks[findPeakNBlocks];
+    cudaError_t err = cudaMemcpy(peaks, d_peaks, findPeakNBlocks * sizeof(Peak), cudaMemcpyDeviceToHost);
+    checkerror(err, __LINE__, __FILE__);
+    
+    Peak p = peaks[0];
+    // serial final reduction
+    for (int i = 1; i < findPeakNBlocks; ++i) {
+        if (abs(peaks[i].val) > abs(p.val))
+            p = peaks[i];
+    }
+
+    return p;
+}
+__host__
+static Peak findPeak(Peak *d_peaks, const float* d_image, size_t size, int this_comp, 
+                     float** d_cross, listModel model)
+{
+    std::cout << size << sqrt(size) << std::endl;
+    // Find peak
+    d_findPeak<<<findPeakNBlocks, findPeakWidth>>>(d_peaks, d_image, size, d_cross, 
+                                                   g_componentSize, 
+                                                   model.peaks, model.n_comp);   
     
     // Get the peaks array back from the device
     Peak peaks[findPeakNBlocks];
@@ -276,6 +363,7 @@ void MultiScaleCuda::deconvolve(const vector<float>& dirty,
 {
     cudaError_t err;
 
+    listModel modelComponentsList;
     // Copy host vectors to device arrays
     for (size_t s=0;s<n_scale;s++) {
        err = cudaMemcpy(d_psf[s], &psf[s][0], psf[0].size() * sizeof(float), cudaMemcpyHostToDevice);
@@ -306,11 +394,12 @@ void MultiScaleCuda::deconvolve(const vector<float>& dirty,
         // Find peak in the residual image
         Peak absPeak;
         absPeak.val=-INT_MAX;
-#if 0
+#if 1
         for (size_t s=0;s<n_scale;s++) {
            //TODO multiply by scale-dependent scale factor
            //TODO think of synonym for "scale", reword preceeding nonsense
-           Peak thisPeak = findPeak(d_peaks[s], d_residual[s], residual[0].size());
+           Peak thisPeak = findPeak(d_peaks[s], d_residual[s], residual[0].size(), s, d_cross[s], 
+                                    modelComponentsList);
            if (thisPeak > absPeak) absPeak=thisPeak;
         }
 #else
@@ -335,6 +424,10 @@ void MultiScaleCuda::deconvolve(const vector<float>& dirty,
 
         // Subtract the PSF from the residual image (this function will launch
         // an kernel asynchronously, need to sync later
+#ifdef __RADIAL_SYM
+        cudaMemcpy(&modelComponentsList.peak[modelComponentsList.n_comp], &absPeak, sizeof(Peak));
+        modelComponentsList.n_comp++;
+#else //__RADIAL_SYM
 #if 1
         for (size_t s=0; s<n_scale; s++) {
            //TODO Do we need to find a center for d_cross?
@@ -350,6 +443,7 @@ void MultiScaleCuda::deconvolve(const vector<float>& dirty,
         //Note, the minus sign in front of -absPeak.val makes this an addition instead
         subtractPSF(d_psf[absPeak.scale], psfWidth, d_model, dirtyWidth, absPeak.pos, psfPeak[absPeak.scale].pos, 
                     -absPeak.val, g_gain);
+#endif //__RADIAL_SYM
     }
 
     // Copy device array back into the host vector
